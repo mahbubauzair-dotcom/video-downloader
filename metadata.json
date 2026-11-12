@@ -1,0 +1,6 @@
+{
+  "name": "M3U8 Stream & Video Downloader Pro",
+  "description": "High-performance graphical M3U8 HLS video downloader, segment inspector, AES-128 decryptor, and batch video merger with offline PWA support.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
