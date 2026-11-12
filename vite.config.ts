@@ -15,7 +15,7 @@ export default defineConfig(() => {
         manifest: {
           id: '/',
           name: 'M3U8 Stream & Video Downloader Pro',
-          short_name: 'M3U8Downloader',
+          short_name: 'M3U8 DL Pro',
           description: 'High-performance graphical M3U8 HLS video downloader, segment inspector, and batch video merger with offline PWA support.',
           theme_color: '#0f172a',
           background_color: '#0f172a',
