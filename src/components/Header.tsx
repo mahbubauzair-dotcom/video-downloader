@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Download, Wifi, WifiOff, Settings, History, HelpCircle, Sparkles, Smartphone, Check, ExternalLink } from 'lucide-react';
+import { Download, Wifi, WifiOff, Settings, History, HelpCircle, Sparkles, Smartphone, Check, ExternalLink, Cloud } from 'lucide-react';
 import { usePWAInstall } from '../hooks/usePWAInstall';
 import { useOnlineStatus } from '../hooks/useOnlineStatus';
 
@@ -7,14 +7,24 @@ interface HeaderProps {
   onOpenSettings: () => void;
   onOpenHistory: () => void;
   onOpenHelp: () => void;
+  onOpenDriveSettings: () => void;
+  driveConnected: boolean;
+  driveFolderName: string;
+  downloadDestination: 'gdrive' | 'local';
   activeDownloadsCount: number;
+  queuedCount?: number;
 }
 
 export const Header: React.FC<HeaderProps> = ({
   onOpenSettings,
   onOpenHistory,
   onOpenHelp,
+  onOpenDriveSettings,
+  driveConnected,
+  driveFolderName,
+  downloadDestination,
   activeDownloadsCount,
+  queuedCount = 0,
 }) => {
   const { isInstallable, isInstalled, isIOS, install } = usePWAInstall();
   const isOnline = useOnlineStatus();
@@ -90,13 +100,34 @@ export const Header: React.FC<HeaderProps> = ({
               </div>
             )}
 
-            {/* History Button */}
+            {/* Google Drive Default Folder Button */}
+            <button
+              onClick={onOpenDriveSettings}
+              className={`hidden sm:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-medium transition ${
+                downloadDestination === 'gdrive' && driveConnected
+                  ? 'bg-sky-500/15 border-sky-500/40 text-sky-300 hover:bg-sky-500/25'
+                  : 'bg-slate-900 border-slate-700/80 text-slate-300 hover:bg-slate-800'
+              }`}
+              title="Configure Google Drive default download folder"
+            >
+              <Cloud className={`w-3.5 h-3.5 ${driveConnected ? 'text-sky-400' : 'text-slate-400'}`} />
+              <span className="max-w-[110px] truncate">
+                {downloadDestination === 'gdrive' ? driveFolderName || 'Google Drive' : 'Local Save'}
+              </span>
+            </button>
+
+            {/* Queue & History Button */}
             <button
               onClick={onOpenHistory}
-              className="p-2 rounded-lg text-slate-400 hover:text-slate-100 hover:bg-slate-800/80 transition"
-              title="Download History"
+              className="relative p-2 rounded-lg text-slate-400 hover:text-slate-100 hover:bg-slate-800/80 transition"
+              title="Download Queue & History"
             >
               <History className="w-4 h-4" />
+              {queuedCount > 0 && (
+                <span className="absolute -top-0.5 -right-0.5 flex h-4 min-w-[16px] px-1 items-center justify-center rounded-full bg-indigo-500 text-[10px] font-bold text-white shadow">
+                  {queuedCount}
+                </span>
+              )}
             </button>
 
             {/* Settings Button */}

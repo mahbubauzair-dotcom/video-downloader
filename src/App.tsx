@@ -27,7 +27,14 @@ import {
   Check,
   ChevronDown,
   ExternalLink,
+  Cloud,
+  FolderOpen,
+  ListPlus,
+  ListOrdered,
+  Plus,
+  Loader2,
 } from 'lucide-react';
+import type { User } from 'firebase/auth';
 import { Header } from './components/Header';
 import { Footer } from './components/Footer';
 import { StreamPlayerModal } from './components/StreamPlayerModal';
@@ -37,6 +44,8 @@ import { SettingsModal } from './components/SettingsModal';
 import { DownloadHistoryModal } from './components/DownloadHistoryModal';
 import { HelpModal } from './components/HelpModal';
 import { DemoStreams } from './components/DemoStreams';
+import { GoogleSignInButton } from './components/GoogleSignInButton';
+import { GoogleDriveModal } from './components/GoogleDriveModal';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
 import {
   M3U8Segment,
@@ -45,8 +54,15 @@ import {
   DownloadSettings,
   DownloadProgress,
   DownloadHistoryItem,
+  QueueItem,
 } from './types/m3u8';
 import { fetchSegmentData, formatBytes, formatTime } from './utils/m3u8Engine';
+import { initAuth, googleSignIn, getAccessToken, logout } from './utils/googleAuth';
+import {
+  findOrCreateDriveFolder,
+  verifyDriveFolderExists,
+  uploadVideoToDrive,
+} from './utils/googleDrive';
 
 const DEFAULT_SETTINGS: DownloadSettings = {
   concurrency: 6,
@@ -59,6 +75,10 @@ const DEFAULT_SETTINGS: DownloadSettings = {
   customAuth: '',
   outputFormat: 'ts',
   filenameTemplate: 'video_{timestamp}.ts',
+  downloadDestination: 'gdrive',
+  alsoSaveLocally: false,
+  googleDriveFolderId: '',
+  googleDriveFolderName: 'M3U8 Downloads',
 };
 
 interface LogEntry {
@@ -79,13 +99,25 @@ export default function App() {
   // Settings & History
   const [settings, setSettings] = useState<DownloadSettings>(() => {
     const saved = localStorage.getItem('m3u8_settings');
-    return saved ? JSON.parse(saved) : DEFAULT_SETTINGS;
+    if (!saved) return DEFAULT_SETTINGS;
+    return {
+      ...DEFAULT_SETTINGS,
+      ...JSON.parse(saved),
+      downloadDestination: JSON.parse(saved).downloadDestination || 'gdrive',
+      googleDriveFolderName: JSON.parse(saved).googleDriveFolderName || 'M3U8 Downloads',
+    };
   });
 
   const [history, setHistory] = useState<DownloadHistoryItem[]>(() => {
     const saved = localStorage.getItem('m3u8_history');
     return saved ? JSON.parse(saved) : [];
   });
+
+  // Google Drive Auth State (access token stays strictly in memory)
+  const [driveUser, setDriveUser] = useState<User | null>(null);
+  const [driveToken, setDriveToken] = useState<string | null>(null);
+  const [isLoggingInDrive, setIsLoggingInDrive] = useState(false);
+  const [isDriveModalOpen, setIsDriveModalOpen] = useState(false);
 
   // Current parsed playlist state
   const [playlist, setPlaylist] = useState<ParsedPlaylist | null>(null);
@@ -118,17 +150,35 @@ export default function App() {
   const [isHelpOpen, setIsHelpOpen] = useState(false);
   const [activeTab, setActiveTab] = useState<'inspector' | 'logs'>('inspector');
 
+  // Queue state & batch input
+  const [queue, setQueue] = useState<QueueItem[]>([]);
+  const [isQueueRunning, setIsQueueRunning] = useState(false);
+  const [showBatchInput, setShowBatchInput] = useState(false);
+  const [batchUrlsText, setBatchUrlsText] = useState('');
+
   // Logs state
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const logContainerRef = useRef<HTMLDivElement>(null);
 
-  // Engine refs to coordinate abort and chunk storage across turns
+  // Engine refs to coordinate abort, queue state, and chunk storage across async turns
   const abortControllerRef = useRef<AbortController | null>(null);
   const isPausedRef = useRef<boolean>(false);
   const downloadedChunksRef = useRef<Map<number, Uint8Array>>(new Map());
   const timerRef = useRef<any>(null);
   const speedBytesRef = useRef<number>(0);
   const speedTimestampRef = useRef<number>(Date.now());
+  const queueRef = useRef<QueueItem[]>([]);
+  const isQueueRunningRef = useRef<boolean>(false);
+  const settingsRef = useRef<DownloadSettings>(settings);
+  const driveTokenRef = useRef<string | null>(driveToken);
+
+  useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
+
+  useEffect(() => {
+    driveTokenRef.current = driveToken;
+  }, [driveToken]);
 
   // Save settings when changed
   useEffect(() => {
@@ -139,6 +189,60 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('m3u8_history', JSON.stringify(history));
   }, [history]);
+
+  // Listen to Firebase Auth state (clear in-memory token on sign-out)
+  useEffect(() => {
+    const unsubscribe = initAuth(
+      (user, token) => {
+        setDriveUser(user);
+        setDriveToken(token);
+      },
+      (user) => {
+        setDriveUser(user);
+        setDriveToken(null);
+      }
+    );
+    return () => unsubscribe();
+  }, []);
+
+  const handleGoogleDriveSignIn = async (): Promise<string | null> => {
+    setIsLoggingInDrive(true);
+    try {
+      const { user, accessToken } = await googleSignIn();
+      setDriveUser(user);
+      setDriveToken(accessToken);
+
+      // Ensure default Google Drive folder exists
+      const targetName = settings.googleDriveFolderName || 'M3U8 Downloads';
+      let folder = settings.googleDriveFolderId
+        ? await verifyDriveFolderExists(accessToken, settings.googleDriveFolderId)
+        : null;
+      if (!folder) {
+        folder = await findOrCreateDriveFolder(accessToken, targetName);
+      }
+
+      setSettings((prev) => ({
+        ...prev,
+        downloadDestination: 'gdrive',
+        googleDriveFolderId: folder!.id,
+        googleDriveFolderName: folder!.name,
+      }));
+      addLog(`Connected Google Drive (${user.email}). Default folder: "${folder.name}"`, 'success');
+      return accessToken;
+    } catch (err: any) {
+      addLog(`Google Drive sign-in failed: ${err.message}`, 'error');
+      throw err;
+    } finally {
+      setIsLoggingInDrive(false);
+    }
+  };
+
+  const handleGoogleDriveSignOut = async () => {
+    await logout();
+    setDriveUser(null);
+    setDriveToken(null);
+    addLog('Signed out of Google Drive.', 'info');
+  };
 
   const addLog = (message: string, level: LogEntry['level'] = 'info') => {
     const newLog: LogEntry = {
@@ -428,48 +532,125 @@ export default function App() {
     addLog('Download cancelled and reset.', 'info');
   };
 
-  // Merge and trigger direct browser save
-  const handleMergeAndSave = () => {
-    setDownloadProgress((prev) => ({ ...prev, state: 'merging' }));
+  const triggerBrowserSave = (blob: Blob, filename: string) => {
+    const downloadUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = downloadUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(downloadUrl), 60000);
+  };
+
+  const buildMergedBlob = (): { blob: Blob; filename: string; totalLength: number; segmentsCount: number } => {
+    const segmentsCount = downloadProgress.segments.length;
+    let totalLength = 0;
+
+    for (let i = 0; i < segmentsCount; i++) {
+      const chunk = downloadedChunksRef.current.get(i);
+      if (chunk) {
+        totalLength += chunk.length;
+      }
+    }
+
+    const mergedArray = new Uint8Array(totalLength);
+    let offset = 0;
+    for (let i = 0; i < segmentsCount; i++) {
+      const chunk = downloadedChunksRef.current.get(i);
+      if (chunk) {
+        mergedArray.set(chunk, offset);
+        offset += chunk.length;
+      }
+    }
+
+    const blob = new Blob([mergedArray.buffer as ArrayBuffer], { type: 'video/mp2t' });
+    const filename = downloadProgress.filename || 'stream_video.ts';
+    return { blob, filename, totalLength, segmentsCount };
+  };
+
+  // Merge and save to Google Drive (default) or Local Device
+  const handleMergeAndSave = async (overrideToken?: string, forceLocal = false) => {
+    setDownloadProgress((prev) => ({
+      ...prev,
+      state: 'merging',
+      errorMessage: undefined,
+      uploadProgressPercent: 0,
+    }));
     addLog('Joining TS chunks into cohesive MPEG-TS video file...', 'info');
 
     try {
-      const segmentsCount = downloadProgress.segments.length;
-      let totalLength = 0;
+      const { blob, filename, totalLength, segmentsCount } = buildMergedBlob();
 
-      for (let i = 0; i < segmentsCount; i++) {
-        const chunk = downloadedChunksRef.current.get(i);
-        if (chunk) {
-          totalLength += chunk.length;
+      const useDrive = !forceLocal && settings.downloadDestination === 'gdrive';
+      if (useDrive) {
+        const token = overrideToken || getAccessToken() || driveToken;
+        if (!token) {
+          setDownloadProgress((prev) => ({
+            ...prev,
+            state: 'error',
+            errorMessage:
+              'Video merged and ready in memory! Sign in with Google to upload to your default Google Drive folder, or download locally.',
+          }));
+          addLog('Google Drive upload paused: please sign in with Google to complete saving to Drive.', 'warn');
+          return;
         }
+
+        setDownloadProgress((prev) => ({ ...prev, state: 'uploading', uploadProgressPercent: 0 }));
+        const folderName = settings.googleDriveFolderName || 'M3U8 Downloads';
+        let folderId = settings.googleDriveFolderId;
+
+        const verified = folderId ? await verifyDriveFolderExists(token, folderId) : null;
+        if (!verified) {
+          const created = await findOrCreateDriveFolder(token, folderName);
+          folderId = created.id;
+          setSettings((prev) => ({
+            ...prev,
+            googleDriveFolderId: created.id,
+            googleDriveFolderName: created.name,
+          }));
+        }
+
+        addLog(`Uploading "${filename}" (${formatBytes(totalLength)}) to Google Drive / ${folderName}...`, 'info');
+
+        const uploaded = await uploadVideoToDrive(token, blob, filename, folderId, (pct) => {
+          setDownloadProgress((prev) => ({ ...prev, uploadProgressPercent: pct }));
+        });
+
+        if (settings.alsoSaveLocally) {
+          triggerBrowserSave(blob, filename);
+        }
+
+        setDownloadProgress((prev) => ({
+          ...prev,
+          state: 'completed',
+          uploadProgressPercent: 100,
+          driveFileLink: uploaded.webViewLink,
+          driveFileName: uploaded.name,
+        }));
+        addLog(`Saved "${uploaded.name}" to Google Drive folder "${folderName}"!`, 'success');
+
+        const historyItem: DownloadHistoryItem = {
+          id: Math.random().toString(36).substring(2, 9),
+          url: playlist?.url || streamUrl,
+          filename: uploaded.name || filename,
+          totalSegments: segmentsCount,
+          totalBytes: totalLength,
+          durationSeconds: playlist?.totalDuration || 0,
+          completedAt: new Date().toISOString(),
+          destination: 'gdrive',
+          driveFileLink: uploaded.webViewLink,
+          driveFolderName: folderName,
+        };
+        setHistory((prev) => [historyItem, ...prev.slice(0, 49)]);
+        return;
       }
 
-      const mergedArray = new Uint8Array(totalLength);
-      let offset = 0;
-      for (let i = 0; i < segmentsCount; i++) {
-        const chunk = downloadedChunksRef.current.get(i);
-        if (chunk) {
-          mergedArray.set(chunk, offset);
-          offset += chunk.length;
-        }
-      }
+      // Local device download
+      triggerBrowserSave(blob, filename);
+      setDownloadProgress((prev) => ({ ...prev, state: 'completed', driveFileLink: undefined }));
+      addLog(`File "${filename}" saved locally (${formatBytes(totalLength)})!`, 'success');
 
-      const blob = new Blob([mergedArray.buffer as ArrayBuffer], { type: 'video/mp2t' });
-      const downloadUrl = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      const filename = downloadProgress.filename || 'stream_video.ts';
-      a.href = downloadUrl;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-
-      setTimeout(() => URL.revokeObjectURL(downloadUrl), 60000);
-
-      setDownloadProgress((prev) => ({ ...prev, state: 'completed' }));
-      addLog(`File "${filename}" saved successfully (${formatBytes(totalLength)})!`, 'success');
-
-      // Record to history
       const historyItem: DownloadHistoryItem = {
         id: Math.random().toString(36).substring(2, 9),
         url: playlist?.url || streamUrl,
@@ -478,14 +659,15 @@ export default function App() {
         totalBytes: totalLength,
         durationSeconds: playlist?.totalDuration || 0,
         completedAt: new Date().toISOString(),
+        destination: 'local',
       };
       setHistory((prev) => [historyItem, ...prev.slice(0, 49)]);
     } catch (err: any) {
-      addLog(`Failed to merge video: ${err.message}`, 'error');
+      addLog(`Failed to save video: ${err.message}`, 'error');
       setDownloadProgress((prev) => ({
         ...prev,
         state: 'error',
-        errorMessage: `Merge failed: ${err.message}`,
+        errorMessage: `Save failed: ${err.message}`,
       }));
     }
   };
@@ -546,10 +728,471 @@ export default function App() {
     handleStartDownload();
   };
 
+  // --- SEQUENTIAL MULTI-URL QUEUE ENGINE ---
+  const updateQueue = (updater: (prev: QueueItem[]) => QueueItem[]) => {
+    const next = updater(queueRef.current);
+    queueRef.current = next;
+    setQueue(next);
+  };
+
+  const updateQueueItem = (id: string, patch: Partial<QueueItem>) => {
+    updateQueue((prev) => prev.map((q) => (q.id === id ? { ...q, ...patch } : q)));
+  };
+
+  const parseUrlsFromInput = (input: string | string[]): string[] => {
+    const rawList = Array.isArray(input) ? input : input.split(/\r?\n/);
+    return rawList
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && /^https?:\/\//i.test(line));
+  };
+
+  const handleAddToQueue = (urlsInput: string | string[], autoStart = false) => {
+    const validUrls = parseUrlsFromInput(urlsInput);
+    if (validUrls.length === 0) {
+      setParseError('Enter at least one valid http:// or https:// M3U8 URL to queue.');
+      return;
+    }
+
+    setParseError(null);
+    const newItems: QueueItem[] = validUrls.map((u) => ({
+      id: Math.random().toString(36).substring(2, 10),
+      url: u,
+      filename: generateFilename(u),
+      status: 'queued',
+      totalSegments: 0,
+      completedSegments: 0,
+      failedSegments: 0,
+      totalBytes: 0,
+      progressPercent: 0,
+      speedBytesSec: 0,
+      durationSeconds: 0,
+      addedAt: new Date().toISOString(),
+    }));
+
+    updateQueue((prev) => [...prev, ...newItems]);
+    addLog(`Added ${newItems.length} M3U8 stream(s) to sequential queue.`, 'info');
+
+    if (autoStart && !isQueueRunningRef.current) {
+      void runQueueLoop();
+    }
+  };
+
+  const processSingleQueueItem = async (item: QueueItem) => {
+    const currentSettings = settingsRef.current;
+    updateQueueItem(item.id, {
+      status: 'parsing',
+      errorMessage: undefined,
+      progressPercent: 0,
+      completedSegments: 0,
+      failedSegments: 0,
+      totalBytes: 0,
+      speedBytesSec: 0,
+    });
+    addLog(`[Queue] Parsing playlist: ${item.url}`, 'info');
+
+    try {
+      const fetchManifest = async (targetUrl: string): Promise<ParsedPlaylist> => {
+        const res = await fetch('/api/parse-m3u8', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            url: targetUrl,
+            headers: {
+              'User-Agent': currentSettings.customUserAgent || undefined,
+              Referer: currentSettings.customReferer || undefined,
+              Cookie: currentSettings.customCookie || undefined,
+              Authorization: currentSettings.customAuth || undefined,
+            },
+          }),
+        });
+        if (!res.ok) {
+          const errJson = await res.json().catch(() => ({}));
+          throw new Error(errJson.error || `HTTP ${res.status}: Failed to parse playlist`);
+        }
+        const parsed: ParsedPlaylist = await res.json();
+        parsed.url = targetUrl;
+        return parsed;
+      };
+
+      let parsed = await fetchManifest(item.url);
+      let resolvedResolution: string | undefined;
+
+      if (parsed.type === 'master') {
+        const variants = parsed.variants || [];
+        if (variants.length === 0) {
+          throw new Error('Master playlist contains no playable variants.');
+        }
+        const bestVariant = [...variants].sort((a, b) => (b.bandwidth || 0) - (a.bandwidth || 0))[0];
+        resolvedResolution = bestVariant.resolution || bestVariant.name;
+        addLog(
+          `[Queue] Master playlist detected. Auto-selected ${resolvedResolution || 'highest bitrate'} stream.`,
+          'info'
+        );
+        parsed = await fetchManifest(bestVariant.uri);
+      }
+
+      const segments = parsed.segments || [];
+      if (segments.length === 0) {
+        throw new Error('Media playlist contains 0 segments.');
+      }
+
+      // Sync active dashboard & segment matrix with current queue item
+      setPlaylist(parsed);
+      downloadedChunksRef.current.clear();
+      isPausedRef.current = false;
+      abortControllerRef.current = new AbortController();
+
+      const totalDuration = parsed.totalDuration || 0;
+      const initializedSegments = segments.map((s) => ({ ...s, status: 'pending' as const }));
+
+      updateQueueItem(item.id, {
+        status: 'downloading',
+        totalSegments: segments.length,
+        durationSeconds: totalDuration,
+        resolution: resolvedResolution,
+      });
+
+      setDownloadProgress({
+        taskId: item.id,
+        url: parsed.url,
+        filename: item.filename,
+        totalSegments: segments.length,
+        completedSegments: 0,
+        failedSegments: 0,
+        totalBytes: 0,
+        currentSpeedBytesSec: 0,
+        elapsedSeconds: 0,
+        etaSeconds: 0,
+        state: 'downloading',
+        segments: initializedSegments,
+      });
+
+      let completedCount = 0;
+      let failedCount = 0;
+      let totalBytesSum = 0;
+      let windowBytes = 0;
+      let windowTs = Date.now();
+
+      if (timerRef.current) clearInterval(timerRef.current);
+      timerRef.current = setInterval(() => {
+        const now = Date.now();
+        const deltaSec = (now - windowTs) / 1000;
+        const speed = deltaSec > 0 ? windowBytes / deltaSec : 0;
+        windowBytes = 0;
+        windowTs = now;
+
+        const remainingSegments = segments.length - completedCount;
+        const avgSegBytes = completedCount > 0 ? totalBytesSum / completedCount : 500000;
+        const eta = speed > 0 ? Math.round((remainingSegments * avgSegBytes) / speed) : 0;
+
+        updateQueueItem(item.id, { speedBytesSec: speed });
+        setDownloadProgress((prev) =>
+          prev.taskId === item.id && prev.state === 'downloading'
+            ? {
+                ...prev,
+                currentSpeedBytesSec: speed,
+                elapsedSeconds: prev.elapsedSeconds + 1,
+                etaSeconds: eta,
+              }
+            : prev
+        );
+      }, 1000);
+
+      const segmentQueue = segments.map((seg, idx) => ({ ...seg, index: idx }));
+
+      const worker = async () => {
+        while (segmentQueue.length > 0 && !isPausedRef.current && isQueueRunningRef.current) {
+          const segment = segmentQueue.shift();
+          if (!segment) break;
+
+          setDownloadProgress((prev) => ({
+            ...prev,
+            segments: prev.segments.map((s) =>
+              s.index === segment.index ? { ...s, status: 'downloading' } : s
+            ),
+          }));
+
+          let attempt = 0;
+          let success = false;
+          let chunkBytes: Uint8Array | null = null;
+          let lastError = '';
+
+          while (
+            attempt < currentSettings.maxRetries &&
+            !success &&
+            !isPausedRef.current &&
+            isQueueRunningRef.current
+          ) {
+            attempt++;
+            try {
+              chunkBytes = await fetchSegmentData(
+                segment,
+                currentSettings,
+                abortControllerRef.current?.signal || new AbortController().signal
+              );
+              success = true;
+            } catch (err: any) {
+              lastError = err.message || 'Fetch failed';
+              if (err.name === 'AbortError') return;
+              if (attempt < currentSettings.maxRetries) {
+                await new Promise((r) => setTimeout(r, 800 * attempt));
+              }
+            }
+          }
+
+          if (success && chunkBytes) {
+            downloadedChunksRef.current.set(segment.index, chunkBytes);
+            completedCount++;
+            totalBytesSum += chunkBytes.length;
+            windowBytes += chunkBytes.length;
+            const pct = Math.round((completedCount / segments.length) * 100);
+
+            updateQueueItem(item.id, {
+              completedSegments: completedCount,
+              totalBytes: totalBytesSum,
+              progressPercent: pct,
+            });
+
+            setDownloadProgress((prev) => ({
+              ...prev,
+              completedSegments: completedCount,
+              totalBytes: totalBytesSum,
+              segments: prev.segments.map((s) =>
+                s.index === segment.index
+                  ? { ...s, status: 'completed', sizeBytes: chunkBytes?.length }
+                  : s
+              ),
+            }));
+          } else if (!isPausedRef.current && isQueueRunningRef.current) {
+            failedCount++;
+            updateQueueItem(item.id, { failedSegments: failedCount });
+            setDownloadProgress((prev) => ({
+              ...prev,
+              failedSegments: failedCount,
+              segments: prev.segments.map((s) =>
+                s.index === segment.index ? { ...s, status: 'failed', error: lastError } : s
+              ),
+            }));
+          }
+        }
+      };
+
+      const workers = Array.from({ length: currentSettings.concurrency }, () => worker());
+      await Promise.all(workers);
+      clearInterval(timerRef.current);
+
+      if (isPausedRef.current || !isQueueRunningRef.current) {
+        updateQueueItem(item.id, { status: 'paused', speedBytesSec: 0 });
+        setDownloadProgress((prev) => ({ ...prev, state: 'paused', currentSpeedBytesSec: 0 }));
+        addLog(`[Queue] Paused "${item.filename}".`, 'warn');
+        return;
+      }
+
+      if (downloadedChunksRef.current.size < segments.length) {
+        throw new Error(
+          `${segments.length - downloadedChunksRef.current.size} segment(s) failed to download.`
+        );
+      }
+
+      // Merge chunks
+      updateQueueItem(item.id, { status: 'merging', speedBytesSec: 0, progressPercent: 100 });
+      setDownloadProgress((prev) => ({ ...prev, state: 'merging', currentSpeedBytesSec: 0 }));
+
+      let totalLength = 0;
+      for (let i = 0; i < segments.length; i++) {
+        totalLength += downloadedChunksRef.current.get(i)?.length || 0;
+      }
+      const mergedArray = new Uint8Array(totalLength);
+      let offset = 0;
+      for (let i = 0; i < segments.length; i++) {
+        const chunk = downloadedChunksRef.current.get(i);
+        if (chunk) {
+          mergedArray.set(chunk, offset);
+          offset += chunk.length;
+        }
+      }
+      const blob = new Blob([mergedArray.buffer as ArrayBuffer], { type: 'video/mp2t' });
+
+      if (currentSettings.downloadDestination === 'gdrive') {
+        const token = driveTokenRef.current || getAccessToken();
+        if (!token) {
+          throw new Error('Google Drive sign-in required to save queued download to Drive.');
+        }
+
+        updateQueueItem(item.id, { status: 'uploading', uploadProgressPercent: 0 });
+        setDownloadProgress((prev) => ({ ...prev, state: 'uploading', uploadProgressPercent: 0 }));
+
+        const folderName = currentSettings.googleDriveFolderName || 'M3U8 Downloads';
+        let folderId = currentSettings.googleDriveFolderId;
+        const verified = folderId ? await verifyDriveFolderExists(token, folderId) : null;
+        if (!verified) {
+          const created = await findOrCreateDriveFolder(token, folderName);
+          folderId = created.id;
+          setSettings((prev) => ({
+            ...prev,
+            googleDriveFolderId: created.id,
+            googleDriveFolderName: created.name,
+          }));
+        }
+
+        const uploaded = await uploadVideoToDrive(token, blob, item.filename, folderId, (pct) => {
+          updateQueueItem(item.id, { uploadProgressPercent: pct });
+          setDownloadProgress((prev) => ({ ...prev, uploadProgressPercent: pct }));
+        });
+
+        if (currentSettings.alsoSaveLocally) {
+          triggerBrowserSave(blob, item.filename);
+        }
+
+        const completedAt = new Date().toISOString();
+        updateQueueItem(item.id, {
+          status: 'completed',
+          progressPercent: 100,
+          uploadProgressPercent: 100,
+          destination: 'gdrive',
+          driveFileLink: uploaded.webViewLink,
+          driveFolderName: folderName,
+          completedAt,
+        });
+        setDownloadProgress((prev) => ({
+          ...prev,
+          state: 'completed',
+          uploadProgressPercent: 100,
+          driveFileLink: uploaded.webViewLink,
+          driveFileName: uploaded.name,
+        }));
+        addLog(`[Queue] Saved "${item.filename}" to Google Drive / ${folderName}.`, 'success');
+
+        setHistory((prev) => [
+          {
+            id: item.id,
+            url: item.url,
+            filename: uploaded.name || item.filename,
+            totalSegments: segments.length,
+            totalBytes: totalLength,
+            durationSeconds: totalDuration,
+            completedAt,
+            resolution: resolvedResolution,
+            destination: 'gdrive',
+            driveFileLink: uploaded.webViewLink,
+            driveFolderName: folderName,
+          },
+          ...prev.slice(0, 49),
+        ]);
+      } else {
+        triggerBrowserSave(blob, item.filename);
+        const completedAt = new Date().toISOString();
+        updateQueueItem(item.id, {
+          status: 'completed',
+          progressPercent: 100,
+          destination: 'local',
+          completedAt,
+        });
+        setDownloadProgress((prev) => ({ ...prev, state: 'completed', driveFileLink: undefined }));
+        addLog(`[Queue] Saved "${item.filename}" locally.`, 'success');
+
+        setHistory((prev) => [
+          {
+            id: item.id,
+            url: item.url,
+            filename: item.filename,
+            totalSegments: segments.length,
+            totalBytes: totalLength,
+            durationSeconds: totalDuration,
+            completedAt,
+            resolution: resolvedResolution,
+            destination: 'local',
+          },
+          ...prev.slice(0, 49),
+        ]);
+      }
+    } catch (err: any) {
+      clearInterval(timerRef.current);
+      const message = err?.message || 'Queue item failed';
+      updateQueueItem(item.id, {
+        status: 'failed',
+        speedBytesSec: 0,
+        errorMessage: message,
+      });
+      addLog(`[Queue] Failed "${item.filename}": ${message}`, 'error');
+    }
+  };
+
+  const runQueueLoop = async () => {
+    if (isQueueRunningRef.current) return;
+    isQueueRunningRef.current = true;
+    setIsQueueRunning(true);
+    isPausedRef.current = false;
+
+    while (isQueueRunningRef.current && !isPausedRef.current) {
+      const nextItem = queueRef.current.find((q) => q.status === 'queued');
+      if (!nextItem) break;
+      await processSingleQueueItem(nextItem);
+    }
+
+    isQueueRunningRef.current = false;
+    setIsQueueRunning(false);
+    if (!isPausedRef.current && !queueRef.current.some((q) => q.status === 'queued')) {
+      addLog('Sequential queue finished processing all items.', 'success');
+    }
+  };
+
+  const handleStartQueue = () => {
+    // Re-queue paused items when user resumes queue
+    updateQueue((prev) =>
+      prev.map((q) => (q.status === 'paused' ? { ...q, status: 'queued' } : q))
+    );
+    void runQueueLoop();
+  };
+
+  const handlePauseQueue = () => {
+    isQueueRunningRef.current = false;
+    isPausedRef.current = true;
+    setIsQueueRunning(false);
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    clearInterval(timerRef.current);
+  };
+
+  const handleRetryQueueItem = (id: string) => {
+    updateQueueItem(id, {
+      status: 'queued',
+      errorMessage: undefined,
+      completedSegments: 0,
+      failedSegments: 0,
+      totalBytes: 0,
+      progressPercent: 0,
+      uploadProgressPercent: 0,
+    });
+    if (!isQueueRunningRef.current) {
+      void runQueueLoop();
+    }
+  };
+
+  const handleRemoveQueueItem = (id: string) => {
+    updateQueue((prev) => prev.filter((q) => q.id !== id));
+  };
+
+  const handleClearFinishedQueue = () => {
+    updateQueue((prev) => prev.filter((q) => q.status !== 'completed' && q.status !== 'failed'));
+  };
+
   const progressPercent =
     downloadProgress.totalSegments > 0
       ? Math.round((downloadProgress.completedSegments / downloadProgress.totalSegments) * 100)
       : 0;
+
+  const activeQueueCount = queue.filter(
+    (q) => q.status !== 'completed' && q.status !== 'failed'
+  ).length;
+  const activeQueueItem = queue.find(
+    (q) =>
+      q.status === 'parsing' ||
+      q.status === 'downloading' ||
+      q.status === 'merging' ||
+      q.status === 'uploading'
+  );
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-indigo-500 selection:text-white">
@@ -561,12 +1204,17 @@ export default function App() {
         </div>
       )}
 
-      {/* Header with PWA install button */}
+      {/* Header with PWA install button & Google Drive indicator */}
       <Header
         onOpenSettings={() => setIsSettingsOpen(true)}
         onOpenHistory={() => setIsHistoryOpen(true)}
         onOpenHelp={() => setIsHelpOpen(true)}
-        activeDownloadsCount={downloadProgress.state === 'downloading' ? 1 : 0}
+        onOpenDriveSettings={() => setIsDriveModalOpen(true)}
+        driveConnected={!!driveToken}
+        driveFolderName={settings.googleDriveFolderName}
+        downloadDestination={settings.downloadDestination}
+        activeDownloadsCount={downloadProgress.state === 'downloading' || isQueueRunning ? 1 : 0}
+        queuedCount={activeQueueCount}
       />
 
       {/* Main Body */}
@@ -619,7 +1267,7 @@ export default function App() {
                 <button
                   onClick={() => handleParseUrl()}
                   disabled={isParsing || !streamUrl.trim()}
-                  className="flex-1 sm:flex-initial flex items-center justify-center gap-2 px-6 py-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-semibold text-sm shadow-lg shadow-indigo-600/30 transition active:scale-95"
+                  className="flex-1 sm:flex-initial flex items-center justify-center gap-2 px-5 py-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-semibold text-sm shadow-lg shadow-indigo-600/30 transition active:scale-95"
                 >
                   {isParsing ? (
                     <>
@@ -634,6 +1282,36 @@ export default function App() {
                   )}
                 </button>
 
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (streamUrl.trim()) {
+                      handleAddToQueue(streamUrl.trim(), false);
+                      setStreamUrl('');
+                    }
+                  }}
+                  disabled={!streamUrl.trim()}
+                  className="flex items-center justify-center gap-1.5 px-3.5 py-3 rounded-xl bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-100 text-xs sm:text-sm font-semibold transition"
+                  title="Add this M3U8 URL to the sequential download queue"
+                >
+                  <Plus className="w-4 h-4 text-indigo-400" />
+                  <span className="hidden md:inline">Add to Queue</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setShowBatchInput((prev) => !prev)}
+                  className={`flex items-center justify-center gap-1.5 px-3.5 py-3 rounded-xl border text-xs sm:text-sm font-semibold transition ${
+                    showBatchInput
+                      ? 'bg-indigo-600/20 border-indigo-500 text-indigo-300'
+                      : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-200'
+                  }`}
+                  title="Batch add multiple M3U8 URLs"
+                >
+                  <ListPlus className="w-4 h-4" />
+                  <span className="hidden lg:inline">Batch URLs</span>
+                </button>
+
                 {streamUrl && (
                   <button
                     onClick={() => setPlayerModal({ open: true, url: streamUrl, title: 'Stream Preview' })}
@@ -645,6 +1323,67 @@ export default function App() {
                 )}
               </div>
             </div>
+
+            {/* Batch Multi-URL Queue Input Panel */}
+            {showBatchInput && (
+              <div className="p-4 rounded-2xl bg-slate-950/90 border border-indigo-500/40 space-y-3 animate-in fade-in">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 text-xs font-semibold text-white">
+                    <ListOrdered className="w-4 h-4 text-indigo-400" />
+                    <span>Sequential Multi-URL Queue (paste one M3U8 URL per line)</span>
+                  </div>
+                  <span className="text-[11px] font-mono text-slate-400">
+                    {parseUrlsFromInput(batchUrlsText).length} valid URL(s)
+                  </span>
+                </div>
+
+                <textarea
+                  rows={4}
+                  value={batchUrlsText}
+                  onChange={(e) => setBatchUrlsText(e.target.value)}
+                  placeholder={'https://example.com/stream1.m3u8\nhttps://example.com/stream2.m3u8\nhttps://example.com/stream3.m3u8'}
+                  className="w-full rounded-xl bg-slate-900 border border-slate-800 p-3 text-xs font-mono text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-indigo-500"
+                />
+
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setIsHistoryOpen(true)}
+                    className="text-xs text-indigo-400 hover:text-indigo-300 font-medium flex items-center gap-1.5 transition"
+                  >
+                    <ListOrdered className="w-3.5 h-3.5" />
+                    <span>View Queue Progress ({queue.length})</span>
+                  </button>
+
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={parseUrlsFromInput(batchUrlsText).length === 0}
+                      onClick={() => {
+                        handleAddToQueue(batchUrlsText, false);
+                        setBatchUrlsText('');
+                      }}
+                      className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-200 text-xs font-semibold transition"
+                    >
+                      Add to Queue
+                    </button>
+                    <button
+                      type="button"
+                      disabled={parseUrlsFromInput(batchUrlsText).length === 0}
+                      onClick={() => {
+                        handleAddToQueue(batchUrlsText, true);
+                        setBatchUrlsText('');
+                        setIsHistoryOpen(true);
+                      }}
+                      className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white text-xs font-semibold transition shadow-md shadow-indigo-600/20 flex items-center gap-1.5"
+                    >
+                      <Play className="w-3.5 h-3.5" />
+                      <span>Add & Start Sequential Queue</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
 
             {/* Quick option toggles below bar */}
             <div className="flex flex-wrap items-center justify-between gap-3 text-xs text-slate-400 px-2">
@@ -677,6 +1416,113 @@ export default function App() {
               <div className="p-3.5 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs flex items-center gap-2 animate-in fade-in">
                 <AlertCircle className="w-4 h-4 flex-shrink-0" />
                 <span>{parseError}</span>
+              </div>
+            )}
+
+            {/* Default Download Folder: Google Drive Status Bar */}
+            <div className="mt-4 p-3.5 rounded-2xl bg-slate-950/90 border border-slate-800/90 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <div className="p-2 rounded-xl bg-sky-500/15 border border-sky-500/30 text-sky-400">
+                  <Cloud className="w-4 h-4" />
+                </div>
+                <div>
+                  <div className="text-xs font-semibold text-white flex items-center gap-2">
+                    <span>Default Download Folder:</span>
+                    {settings.downloadDestination === 'gdrive' ? (
+                      <span className="text-sky-300 font-mono">
+                        Google Drive / {settings.googleDriveFolderName || 'M3U8 Downloads'}
+                      </span>
+                    ) : (
+                      <span className="text-indigo-300 font-mono">Local Browser Downloads</span>
+                    )}
+                  </div>
+                  <p className="text-[11px] text-slate-400">
+                    {driveToken && driveUser
+                      ? `Connected as ${driveUser.email}`
+                      : settings.downloadDestination === 'gdrive'
+                      ? 'Sign in with Google to save downloads directly into your Drive folder'
+                      : 'Downloads save locally to your device'}
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 flex-wrap">
+                {settings.downloadDestination === 'gdrive' && !driveToken && (
+                  <GoogleSignInButton
+                    onClick={() => handleGoogleDriveSignIn().catch(() => {})}
+                    disabled={isLoggingInDrive}
+                    label={isLoggingInDrive ? 'Connecting...' : 'Sign in with Google'}
+                  />
+                )}
+                <button
+                  type="button"
+                  onClick={() => setIsDriveModalOpen(true)}
+                  className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold transition"
+                >
+                  <FolderOpen className="w-3.5 h-3.5 text-sky-400" />
+                  <span>{driveToken ? 'Change Folder' : 'Folder Settings'}</span>
+                </button>
+              </div>
+            </div>
+            {/* Live Sequential Queue Status Strip */}
+            {queue.length > 0 && (
+              <div className="mt-3 p-3.5 rounded-2xl bg-indigo-950/30 border border-indigo-500/35 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+                <div className="flex items-center gap-3 min-w-0">
+                  <div className="p-2 rounded-xl bg-indigo-500/20 border border-indigo-500/30 text-indigo-300">
+                    {isQueueRunning ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <ListOrdered className="w-4 h-4" />
+                    )}
+                  </div>
+                  <div className="min-w-0">
+                    <div className="text-xs font-semibold text-white truncate">
+                      {activeQueueItem
+                        ? `Queue Active: ${activeQueueItem.filename} (${
+                            activeQueueItem.status === 'uploading'
+                              ? `Uploading ${activeQueueItem.uploadProgressPercent ?? 0}%`
+                              : `${activeQueueItem.progressPercent}%`
+                          })`
+                        : `Sequential Queue (${queue.length} item${queue.length === 1 ? '' : 's'})`}
+                    </div>
+                    <p className="text-[11px] text-slate-400">
+                      {activeQueueCount} pending/active •{' '}
+                      {queue.filter((q) => q.status === 'completed').length} completed
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2 flex-wrap">
+                  {isQueueRunning ? (
+                    <button
+                      type="button"
+                      onClick={handlePauseQueue}
+                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold transition"
+                    >
+                      <Pause className="w-3.5 h-3.5" />
+                      <span>Pause Queue</span>
+                    </button>
+                  ) : (
+                    queue.some((q) => q.status === 'queued' || q.status === 'paused') && (
+                      <button
+                        type="button"
+                        onClick={handleStartQueue}
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold transition"
+                      >
+                        <Play className="w-3.5 h-3.5" />
+                        <span>Start Queue</span>
+                      </button>
+                    )
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setIsHistoryOpen(true)}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold transition"
+                  >
+                    <ListOrdered className="w-3.5 h-3.5 text-indigo-400" />
+                    <span>View Progress</span>
+                  </button>
+                </div>
               </div>
             )}
           </div>
@@ -827,23 +1673,101 @@ export default function App() {
                     </div>
                   </div>
 
+                  {/* Google Drive Upload Progress */}
+                  {downloadProgress.state === 'uploading' && (
+                    <div className="mt-4 p-4 rounded-xl bg-sky-950/40 border border-sky-500/40 space-y-2 animate-in fade-in">
+                      <div className="flex items-center justify-between text-xs font-semibold text-sky-200">
+                        <span className="flex items-center gap-2">
+                          <Cloud className="w-4 h-4 text-sky-400 animate-bounce" />
+                          <span>Uploading to Google Drive / {settings.googleDriveFolderName || 'M3U8 Downloads'}...</span>
+                        </span>
+                        <span className="font-mono">{downloadProgress.uploadProgressPercent || 0}%</span>
+                      </div>
+                      <div className="h-2 w-full bg-slate-950 rounded-full overflow-hidden border border-slate-800">
+                        <div
+                          className="h-full bg-gradient-to-r from-sky-500 to-indigo-400 transition-all duration-200"
+                          style={{ width: `${downloadProgress.uploadProgressPercent || 0}%` }}
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Error / Auth Needed for Google Drive Upload */}
+                  {downloadProgress.state === 'error' && downloadProgress.errorMessage && (
+                    <div className="mt-4 p-4 rounded-xl bg-amber-950/40 border border-amber-500/40 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 animate-in fade-in">
+                      <div className="flex items-start gap-3">
+                        <AlertCircle className="w-5 h-5 text-amber-400 flex-shrink-0 mt-0.5" />
+                        <div>
+                          <h4 className="font-bold text-white text-sm">Action Needed to Finish Saving</h4>
+                          <p className="text-xs text-amber-200 mt-0.5">{downloadProgress.errorMessage}</p>
+                        </div>
+                      </div>
+                      {downloadedChunksRef.current.size === downloadProgress.segments.length && (
+                        <div className="flex items-center gap-2 flex-wrap flex-shrink-0">
+                          <GoogleSignInButton
+                            onClick={async () => {
+                              try {
+                                const token = await handleGoogleDriveSignIn();
+                                if (token) {
+                                  await handleMergeAndSave(token, false);
+                                }
+                              } catch {
+                                // logged inside handleGoogleDriveSignIn
+                              }
+                            }}
+                            disabled={isLoggingInDrive}
+                            label={isLoggingInDrive ? 'Connecting...' : 'Sign in & Save to Drive'}
+                          />
+                          <button
+                            type="button"
+                            onClick={() => handleMergeAndSave(undefined, true)}
+                            className="px-3.5 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold transition"
+                          >
+                            Save Locally Instead
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
                   {/* Merged File Download Ready Card */}
                   {downloadProgress.state === 'completed' && (
-                    <div className="mt-4 p-4 rounded-xl bg-emerald-950/40 border border-emerald-500/40 flex items-center justify-between gap-4 animate-in fade-in">
+                    <div className="mt-4 p-4 rounded-xl bg-emerald-950/40 border border-emerald-500/40 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 animate-in fade-in">
                       <div className="flex items-center gap-3">
                         <CheckCircle2 className="w-6 h-6 text-emerald-400 flex-shrink-0" />
                         <div>
-                          <h4 className="font-bold text-white text-sm">Download & Merge Complete!</h4>
-                          <p className="text-xs text-emerald-300">Video saved as {downloadProgress.filename}</p>
+                          <h4 className="font-bold text-white text-sm">
+                            {downloadProgress.driveFileLink
+                              ? 'Saved to Google Drive!'
+                              : 'Download & Merge Complete!'}
+                          </h4>
+                          <p className="text-xs text-emerald-300">
+                            {downloadProgress.driveFileLink
+                              ? `Uploaded "${downloadProgress.driveFileName || downloadProgress.filename}" to ${settings.googleDriveFolderName || 'M3U8 Downloads'}`
+                              : `Video saved as ${downloadProgress.filename}`}
+                          </p>
                         </div>
                       </div>
-                      <button
-                        onClick={handleMergeAndSave}
-                        className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold transition flex items-center gap-2"
-                      >
-                        <FolderDown className="w-4 h-4" />
-                        <span>Save Again</span>
-                      </button>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        {downloadProgress.driveFileLink && (
+                          <a
+                            href={downloadProgress.driveFileLink}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold transition flex items-center gap-2"
+                          >
+                            <Cloud className="w-4 h-4" />
+                            <span>Open in Drive</span>
+                          </a>
+                        )}
+                        <button
+                          onClick={() => handleMergeAndSave(undefined, true)}
+                          className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold transition flex items-center gap-2"
+                        >
+                          <FolderDown className="w-4 h-4" />
+                          <span>Save Local Copy</span>
+                        </button>
+                      </div>
                     </div>
                   )}
                 </div>
@@ -945,13 +1869,51 @@ export default function App() {
             setSettings(newSettings);
             addLog(`Settings updated: Concurrency=${newSettings.concurrency}, Retries=${newSettings.maxRetries}`, 'info');
           }}
+          onOpenDriveSettings={() => setIsDriveModalOpen(true)}
           onClose={() => setIsSettingsOpen(false)}
+        />
+      )}
+
+      {isDriveModalOpen && (
+        <GoogleDriveModal
+          user={driveUser}
+          accessToken={driveToken}
+          selectedFolderId={settings.googleDriveFolderId}
+          selectedFolderName={settings.googleDriveFolderName}
+          downloadDestination={settings.downloadDestination}
+          alsoSaveLocally={settings.alsoSaveLocally}
+          onSignIn={handleGoogleDriveSignIn}
+          onSignOut={handleGoogleDriveSignOut}
+          onSelectFolder={(folder) => {
+            setSettings((prev) => ({
+              ...prev,
+              downloadDestination: 'gdrive',
+              googleDriveFolderId: folder.id,
+              googleDriveFolderName: folder.name,
+            }));
+            addLog(`Default Google Drive folder set to "${folder.name}".`, 'success');
+          }}
+          onChangeDestination={(dest, alsoLocal) => {
+            setSettings((prev) => ({
+              ...prev,
+              downloadDestination: dest,
+              alsoSaveLocally: alsoLocal,
+            }));
+          }}
+          onClose={() => setIsDriveModalOpen(false)}
         />
       )}
 
       {isHistoryOpen && (
         <DownloadHistoryModal
           history={history}
+          queue={queue}
+          isQueueRunning={isQueueRunning}
+          onStartQueue={handleStartQueue}
+          onPauseQueue={handlePauseQueue}
+          onRetryQueueItem={handleRetryQueueItem}
+          onRemoveQueueItem={handleRemoveQueueItem}
+          onClearFinishedQueue={handleClearFinishedQueue}
           onClearHistory={() => setHistory([])}
           onLoadUrl={(url) => {
             setStreamUrl(url);

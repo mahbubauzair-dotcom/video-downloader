@@ -1,16 +1,18 @@
 import React from 'react';
 import { DownloadSettings } from '../types/m3u8';
-import { X, Sliders, Shield, Globe, Key, Clock, FileCode, Check } from 'lucide-react';
+import { X, Sliders, Shield, Globe, Key, Clock, FileCode, Check, Cloud, HardDrive, FolderOpen } from 'lucide-react';
 
 interface SettingsModalProps {
   settings: DownloadSettings;
   onSave: (newSettings: DownloadSettings) => void;
+  onOpenDriveSettings: () => void;
   onClose: () => void;
 }
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({
   settings,
   onSave,
+  onOpenDriveSettings,
   onClose,
 }) => {
   const [formData, setFormData] = React.useState<DownloadSettings>({ ...settings });
@@ -115,6 +117,74 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 <div className="w-11 h-6 bg-slate-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-indigo-600"></div>
               </label>
             </div>
+          </div>
+
+          {/* Default Download Destination */}
+          <div className="bg-slate-950 p-4 rounded-xl border border-slate-800 space-y-3">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <Cloud className="w-4 h-4 text-sky-400" />
+                <div>
+                  <span className="text-xs font-semibold text-white block">Default Download Destination</span>
+                  <span className="text-[11px] text-slate-400">
+                    {formData.downloadDestination === 'gdrive'
+                      ? `Google Drive / ${formData.googleDriveFolderName || 'M3U8 Downloads'}`
+                      : 'Local Browser Downloads'}
+                  </span>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  onSave(formData);
+                  onClose();
+                  onOpenDriveSettings();
+                }}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-sky-300 text-xs font-semibold transition"
+              >
+                <FolderOpen className="w-3.5 h-3.5" />
+                <span>Configure Drive</span>
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => setFormData({ ...formData, downloadDestination: 'gdrive' })}
+                className={`flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg text-xs font-semibold border transition ${
+                  formData.downloadDestination === 'gdrive'
+                    ? 'bg-indigo-600/20 border-indigo-500 text-white'
+                    : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <Cloud className="w-3.5 h-3.5 text-sky-400" />
+                <span>Google Drive</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setFormData({ ...formData, downloadDestination: 'local' })}
+                className={`flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg text-xs font-semibold border transition ${
+                  formData.downloadDestination === 'local'
+                    ? 'bg-indigo-600/20 border-indigo-500 text-white'
+                    : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <HardDrive className="w-3.5 h-3.5 text-indigo-400" />
+                <span>Local Device</span>
+              </button>
+            </div>
+
+            {formData.downloadDestination === 'gdrive' && (
+              <label className="flex items-center justify-between pt-1 cursor-pointer">
+                <span className="text-[11px] text-slate-300">Also save a local copy to device</span>
+                <input
+                  type="checkbox"
+                  checked={formData.alsoSaveLocally}
+                  onChange={(e) => setFormData({ ...formData, alsoSaveLocally: e.target.checked })}
+                  className="rounded bg-slate-800 border-slate-700 text-indigo-600 focus:ring-0 w-3.5 h-3.5"
+                />
+              </label>
+            )}
           </div>
 
           {/* Custom Headers */}

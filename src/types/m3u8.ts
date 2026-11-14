@@ -55,6 +55,10 @@ export interface DownloadSettings {
   customAuth: string;
   outputFormat: 'ts' | 'mp4';
   filenameTemplate: string;
+  downloadDestination: 'gdrive' | 'local';
+  alsoSaveLocally: boolean;
+  googleDriveFolderId: string;
+  googleDriveFolderName: string;
 }
 
 export interface DownloadProgress {
@@ -68,7 +72,10 @@ export interface DownloadProgress {
   currentSpeedBytesSec: number;
   elapsedSeconds: number;
   etaSeconds: number;
-  state: 'idle' | 'parsing' | 'downloading' | 'paused' | 'merging' | 'completed' | 'error';
+  state: 'idle' | 'parsing' | 'downloading' | 'paused' | 'merging' | 'uploading' | 'completed' | 'error';
+  uploadProgressPercent?: number;
+  driveFileLink?: string;
+  driveFileName?: string;
   errorMessage?: string;
   segments: M3U8Segment[];
 }
@@ -82,4 +89,40 @@ export interface DownloadHistoryItem {
   durationSeconds: number;
   completedAt: string;
   resolution?: string;
+  destination?: 'gdrive' | 'local';
+  driveFileLink?: string;
+  driveFolderName?: string;
 }
+
+export type QueueItemStatus =
+  | 'queued'
+  | 'parsing'
+  | 'downloading'
+  | 'merging'
+  | 'uploading'
+  | 'completed'
+  | 'failed'
+  | 'paused';
+
+export interface QueueItem {
+  id: string;
+  url: string;
+  filename: string;
+  status: QueueItemStatus;
+  totalSegments: number;
+  completedSegments: number;
+  failedSegments: number;
+  totalBytes: number;
+  progressPercent: number;
+  uploadProgressPercent?: number;
+  speedBytesSec: number;
+  durationSeconds: number;
+  resolution?: string;
+  destination?: 'gdrive' | 'local';
+  driveFileLink?: string;
+  driveFolderName?: string;
+  errorMessage?: string;
+  addedAt: string;
+  completedAt?: string;
+}
+
